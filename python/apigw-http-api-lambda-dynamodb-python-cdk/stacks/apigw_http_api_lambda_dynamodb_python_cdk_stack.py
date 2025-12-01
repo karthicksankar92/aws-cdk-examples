@@ -9,7 +9,7 @@ from aws_cdk import (
     aws_apigateway as apigw_,
     aws_ec2 as ec2,
     aws_iam as iam,
-    aws_logs as logs,
+    aws_synthetics as synthetics,
     Duration,
 )
 from constructs import Construct
@@ -59,17 +59,16 @@ class ApigwHttpApiLambdaDynamodbPythonCdkStack(Stack):
             )
         )
 
-        # Create DynamoDb Table with Point-in-Time Recovery
+        # Create DynamoDb Table
         demo_table = dynamodb_.Table(
             self,
             TABLE_NAME,
             partition_key=dynamodb_.Attribute(
                 name="id", type=dynamodb_.AttributeType.STRING
             ),
-            point_in_time_recovery=True,
         )
 
-        # Create the Lambda function to receive the request
+        # Create the Lambda function to receive the request with X-Ray tracing enabled
         api_hanlder = lambda_.Function(
             self,
             "ApiHandler",
@@ -83,55 +82,73 @@ class ApigwHttpApiLambdaDynamodbPythonCdkStack(Stack):
             ),
             memory_size=1024,
             timeout=Duration.minutes(5),
-            log_retention=logs.RetentionDays.ONE_YEAR,
+            tracing=lambda_.Tracing.ACTIVE,
         )
 
         # grant permission to lambda to write to demo table
         demo_table.grant_write_data(api_hanlder)
         api_hanlder.add_environment("TABLE_NAME", demo_table.table_name)
 
-        # Create log group for API Gateway access logs
-        api_log_group = logs.LogGroup(
-            self,
-            "ApiGatewayAccessLogs",
-            retention=logs.RetentionDays.ONE_YEAR
-        )
-
-        # Create API Gateway with logging enabled
-        apigw_.LambdaRestApi(
+        # Create API Gateway with X-Ray tracing enabled
+        api = apigw_.LambdaRestApi(
             self,
             "Endpoint",
             handler=api_hanlder,
             deploy_options=apigw_.StageOptions(
-                access_log_destination=apigw_.LogGroupLogDestination(api_log_group),
-                access_log_format=apigw_.AccessLogFormat.json_with_standard_fields(
-                    caller=True,
-                    http_method=True,
-                    ip=True,
-                    protocol=True,
-                    request_time=True,
-                    resource_path=True,
-                    response_length=True,
-                    status=True,
-                    user=True
-                ),
-                logging_level=apigw_.MethodLoggingLevel.INFO,
-                data_trace_enabled=True,
-                metrics_enabled=True
+                tracing_enabled=True
             )
         )
 
-        # Create log group for VPC Flow Logs
-        vpc_flow_log_group = logs.LogGroup(
+        # Create CloudWatch Synthetic Canary for proactive monitoring
+        canary = synthetics.Canary(
             self,
-            "VpcFlowLogs",
-            retention=logs.RetentionDays.ONE_YEAR
-        )
+            "ApiCanary",
+            canary_name="apigw-endpoint-monitor",
+            runtime=synthetics.Runtime.SYNTHETICS_NODEJS_PUPPETEER_6_2,
+            test=synthetics.Test.custom(
+                handler="index.handler",
+                code=synthetics.Code.from_inline(f"""
+const synthetics = require('Synthetics');
+const log = require('SyntheticsLogger');
+const https = require('https');
+const http = require('http');
+const {{ URL }} = require('url');
 
-        # Enable VPC Flow Logs
-        ec2.FlowLog(
-            self,
-            "FlowLog",
-            resource_type=ec2.FlowLogResourceType.from_vpc(vpc),
-            destination=ec2.FlowLogDestination.to_cloud_watch_logs(vpc_flow_log_group)
+const apiCanaryBlueprint = async function () {{
+    const url = '{api.url}';
+    const parsedUrl = new URL(url);
+    
+    const requestOptions = {{
+        hostname: parsedUrl.hostname,
+        path: parsedUrl.pathname,
+        method: 'GET',
+        port: parsedUrl.port || (parsedUrl.protocol === 'https:' ? 443 : 80)
+    }};
+    
+    const protocol = parsedUrl.protocol === 'https:' ? https : http;
+    
+    return new Promise((resolve, reject) => {{
+        const req = protocol.request(requestOptions, (res) => {{
+            log.info(`Status Code: ${{res.statusCode}}`);
+            if (res.statusCode === 200 || res.statusCode === 403) {{
+                resolve();
+            }} else {{
+                reject(new Error(`Failed with status code: ${{res.statusCode}}`));
+            }}
+        }});
+        
+        req.on('error', (error) => {{
+            reject(error);
+        }});
+        
+        req.end();
+    }});
+}};
+
+exports.handler = async () => {{
+    return await apiCanaryBlueprint();
+}};
+""")
+            ),
+            schedule=synthetics.Schedule.rate(Duration.minutes(5))
         )
